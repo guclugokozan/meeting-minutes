@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Recorder & Summarizer</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #333; }
+        button {
+            background-color: #007bff; color: white; border: none; padding: 10px 15px;
+            margin: 5px; border-radius: 5px; cursor: pointer; font-size: 16px;
+        }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        .transcript-container, .summary-container {
+            margin-top: 20px; padding: 15px; border: 1px solid #ddd;
+            border-radius: 5px; background-color: #f9f9f9; min-height: 100px;
+        }
+        .status { margin-top: 15px; font-style: italic; color: #555; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Meeting Recorder & Summarizer</h1>
+
+        <button id="startButton">Start Recording</button>
+        <button id="stopButton" disabled>Stop Recording</button>
+
+        <h2>Real-time Transcript</h2>
+        <div id="realtimeTranscript" class="transcript-container"></div>
+
+        <h2>Summary</h2>
+        <div id="summary" class="summary-container"></div>
+
+        <div id="statusMessages" class="status"></div>
+    </div>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const realtimeTranscriptDiv = document.getElementById('realtimeTranscript');
+        const summaryDiv = document.getElementById('summary');
+        const statusMessagesDiv = document.getElementById('statusMessages');
+
+        const BACKEND_URL = 'http://localhost:5167';
+
+        let isRecording = false;
+        let recognition;
+        let fullTranscript = '';
+        let meetingId = '';
+        let processId = ''; // For summary processing
+
+        // Web Speech API setup
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscriptSegment = '';
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscriptSegment += event.results[i][0].transcript;
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+                if (finalTranscriptSegment) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    fullTranscript += `<div>[${timestamp}] ${finalTranscriptSegment}</div>`;
+                }
+                realtimeTranscriptDiv.innerHTML = fullTranscript + '<i style="color:grey;">' + interimTranscript + '</i>';
+            };
+
+            recognition.onerror = (event) => {
+                logStatus(`Speech recognition error: ${event.error}`, true);
+                if (isRecording) { // Try to restart if an error occurs during recording
+                    setTimeout(() => {
+                        if (isRecording) recognition.start();
+                    }, 100);
+                }
+            };
+
+            recognition.onend = () => {
+                logStatus(`onend fired. isRecording: ${isRecording}`);
+                if (isRecording) { // If still recording, restart it with a small delay.
+                    setTimeout(() => {
+                        if (isRecording) { // Check again inside timeout, state might have changed
+                            logStatus('onend: Delayed restart attempt...');
+                            try {
+                                recognition.start();
+                                logStatus('onend: recognition.start() called after delay.');
+                            } catch(e) {
+                                logStatus(`Error restarting recognition from onend (delayed): ${e.message}`, true);
+                                console.error("Error in onend delayed restart:", e);
+                                stopRecordingLogic(); // Force stop if restart fails, to prevent loops with bad state
+                            }
+                        } else {
+                             logStatus('onend: Delay triggered, but isRecording is now false. Not restarting.');
+                        }
+                    }, 100); // 100ms delay
+                } else {
+                    logStatus('onend: isRecording is false. Not restarting.');
+                }
+            };
+        } else {
+            logStatus("Web Speech API is not supported in this browser.", true);
+            startButton.disabled = true;
+            stopButton.disabled = true;
+        }
+
+        function logStatus(message, isError = false) {
+            console.log(message);
+            const statusElement = document.createElement('p');
+            statusElement.textContent = message;
+            if (isError) {
+                statusElement.classList.add('error');
+            }
+            statusMessagesDiv.appendChild(statusElement);
+            statusMessagesDiv.scrollTop = statusMessagesDiv.scrollHeight;
+        }
+
+        async function fetchModelConfig() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/get-model-config`);
+                if (!response.ok) {
+                    logStatus(`Error fetching model config: ${response.statusText}`, true);
+                    return { provider: "openai", model: "gpt-4o-mini", whisperModel: "whisper-1" }; // Fallback
+                }
+                const config = await response.json();
+                // Ensure essential fields exist, provide defaults if not
+                return {
+                    provider: config.provider || "openai",
+                    model: config.model || "gpt-4o-mini", // Default model for summarization
+                    whisperModel: config.whisperModel || "whisper-1" // Though not directly used by this client STT
+                };
+            } catch (error) {
+                logStatus(`Failed to fetch model config: ${error.message}`, true);
+                return { provider: "openai", model: "gpt-4o-mini", whisperModel: "whisper-1" }; // Fallback
+            }
+        }
+
+
+        startButton.onclick = () => {
+            if (!SpeechRecognition) {
+                logStatus("Cannot start: Web Speech API not supported.", true);
+                return;
+            }
+            isRecording = true;
+            fullTranscript = '';
+            realtimeTranscriptDiv.innerHTML = '';
+            summaryDiv.innerHTML = '';
+            statusMessagesDiv.innerHTML = '';
+            logStatus('Recording started...');
+            meetingId = `meeting-${Date.now()}`; // Simple unique ID for this session
+
+            try {
+                recognition.start();
+            } catch (e) {
+                 logStatus(`Error starting recognition: ${e.message}`, true);
+                 isRecording = false;
+                 return;
+            }
+
+            startButton.disabled = true;
+            stopButton.disabled = false;
+        };
+
+        const stopRecordingLogic = async () => {
+            logStatus('stopRecordingLogic: Entered function.');
+            if (!isRecording) {
+                logStatus('stopRecordingLogic: Exiting because isRecording is false.');
+                return;
+            }
+            logStatus('stopRecordingLogic: isRecording is true.');
+            isRecording = false;
+            if (recognition) {
+                logStatus('stopRecordingLogic: Stopping recognition.');
+                recognition.stop();
+            }
+            logStatus('Recording stopped. Processing transcript for summary...');
+            startButton.disabled = false;
+            stopButton.disabled = true;
+
+            logStatus(`stopRecordingLogic: fullTranscript length: ${fullTranscript.trim().length}`);
+            if (fullTranscript.trim().length === 0) {
+                logStatus('No transcript recorded to summarize.', true);
+                logStatus('stopRecordingLogic: Exiting because fullTranscript is empty.');
+                return;
+            }
+            logStatus('stopRecordingLogic: fullTranscript is not empty.');
+
+            try {
+                logStatus('stopRecordingLogic: Attempting to fetch model config...');
+                const modelConfig = await fetchModelConfig();
+                logStatus(`stopRecordingLogic: fetchModelConfig returned: ${JSON.stringify(modelConfig)}`);
+
+                if (!modelConfig || !modelConfig.model || !modelConfig.provider) {
+                    logStatus('Failed to get valid model configuration for summary.', true);
+                    logStatus('stopRecordingLogic: Exiting because modelConfig is invalid.');
+                    return;
+                }
+                logStatus('stopRecordingLogic: Model config is valid.');
+
+                const payload = {
+                    text: fullTranscript,
+                    model: modelConfig.provider, // API expects provider here
+                    model_name: modelConfig.model, // API expects model name here
+                    meeting_id: meetingId,
+                    // chunk_size and overlap can be omitted to use backend defaults
+                };
+                logStatus(`stopRecordingLogic: Payload for /process-transcript: ${JSON.stringify(payload)}`);
+
+                logStatus('stopRecordingLogic: Attempting to call /process-transcript...');
+                const response = await fetch(`${BACKEND_URL}/process-transcript`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                logStatus(`stopRecordingLogic: /process-transcript response status: ${response.status}`);
+
+                if (!response.ok) {
+                    const errorData = await response.text();
+                    logStatus(`stopRecordingLogic: /process-transcript error data: ${errorData}`);
+                    throw new Error(`Failed to start summary processing: ${response.status} ${errorData}`);
+                }
+
+                const result = await response.json();
+                logStatus(`stopRecordingLogic: /process-transcript result: ${JSON.stringify(result)}`);
+                processId = result.process_id; // The backend uses process_id, but get-summary uses meeting_id
+                logStatus(`Summary processing started. Meeting ID: ${meetingId}, Process ID: ${processId}. Polling for results...`);
+                pollForSummary(meetingId);
+            } catch (error) {
+                logStatus(`Error processing transcript: ${error.message}`, true);
+                logStatus(`stopRecordingLogic: Caught error: ${error.stack || error}`);
+            }
+        };
+
+        stopButton.onclick = stopRecordingLogic;
+
+
+        async function pollForSummary(currentMeetingId) {
+            if (!currentMeetingId) {
+                logStatus("No meeting ID to poll for summary.", true);
+                return;
+            }
+            try {
+                const response = await fetch(`${BACKEND_URL}/get-summary/${currentMeetingId}`);
+                if (!response.ok) {
+                    // Handle non-2xx responses that might still contain JSON
+                    const errorData = await response.json().catch(() => ({ error: `HTTP error ${response.status}` }));
+                     if (response.status === 404) {
+                        logStatus(`Summary not found for meeting ${currentMeetingId}. Retrying...`, true);
+                    } else {
+                        logStatus(`Error fetching summary: ${errorData.error || response.statusText}`, true);
+                    }
+                    // Continue polling for specific cases or stop for others
+                    if (response.status !== 404 && response.status !== 202) { // Stop polling on critical errors other than "not found" or "processing"
+                         return;
+                    }
+                } else {
+                     const result = await response.json();
+                     logStatus(`Polling status for ${currentMeetingId}: ${result.status}`);
+
+                    if (result.status === 'completed') {
+                        summaryDiv.innerHTML = ''; // Clear previous
+                        logStatus('Summary received. Formatting display...');
+
+                        const summaryData = result.data; // This is already an object if parsed correctly by backend
+
+                        if (summaryData && typeof summaryData === 'object') {
+                            // Display Meeting Name
+                            if (summaryData.MeetingName) {
+                                const meetingNameHeader = document.createElement('h2');
+                                meetingNameHeader.textContent = summaryData.MeetingName;
+                                summaryDiv.appendChild(meetingNameHeader);
+                            }
+
+                            // Iterate over sections
+                            for (const sectionKey in summaryData) {
+                                if (summaryData.hasOwnProperty(sectionKey) && sectionKey !== 'MeetingName') {
+                                    const section = summaryData[sectionKey];
+                                    if (section && section.title && Array.isArray(section.blocks)) {
+                                        const sectionTitle = document.createElement('h3');
+                                        sectionTitle.textContent = section.title;
+                                        summaryDiv.appendChild(sectionTitle);
+
+                                        if (section.blocks.length > 0) {
+                                            const ul = document.createElement('ul');
+                                            section.blocks.forEach(block => {
+                                                if (block && block.content) {
+                                                    const li = document.createElement('li');
+                                                    // For now, just display content. Could be enhanced based on block.type
+                                                    li.textContent = block.content;
+                                                    if (block.color) {
+                                                        li.style.color = block.color;
+                                                    }
+                                                    ul.appendChild(li);
+                                                }
+                                            });
+                                            if (ul.hasChildNodes()) {
+                                                summaryDiv.appendChild(ul);
+                                            } else {
+                                                const p = document.createElement('p');
+                                                p.textContent = 'No items in this section.';
+                                                p.style.fontStyle = 'italic';
+                                                summaryDiv.appendChild(p);
+                                            }
+                                        } else {
+                                            const p = document.createElement('p');
+                                            p.textContent = 'No items in this section.';
+                                            p.style.fontStyle = 'italic';
+                                            summaryDiv.appendChild(p);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            logStatus('Summary data is not in the expected format or is null.', true);
+                            const pre = document.createElement('pre');
+                            pre.textContent = JSON.stringify(result.data, null, 2); // Show raw if format is unexpected
+                            summaryDiv.appendChild(pre);
+                        }
+                        return; // Stop polling
+                    } else if (result.status === 'error') {
+                        logStatus(`Summarization failed: ${result.error}`, true);
+                        summaryDiv.textContent = `Error: ${result.error}`;
+                        return; // Stop polling
+                    }
+                }
+                // If still processing or retrying, poll again
+                setTimeout(() => pollForSummary(currentMeetingId), 5000);
+
+            } catch (error) {
+                logStatus(`Error polling for summary: ${error.message}`, true);
+                setTimeout(() => pollForSummary(currentMeetingId), 5000); // Retry on network error
+            }
+        }
+    </script>
+</body>
+</html>

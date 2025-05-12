@@ -4,106 +4,68 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 from typing import Optional, List
+import os # For path joining
 import logging
 from dotenv import load_dotenv
 from db import DatabaseManager
 import json
-from threading import Lock
 from transcript_processor import TranscriptProcessor
+import time # Already imported in original, but good to ensure it's available if used by new logging
+
+# Configure root logger as early as possible
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(name)s:%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler()] # Output to console
+)
 import time
 
 # Load environment variables
-load_dotenv()
+logger_for_env_loading = logging.getLogger(__name__) # Use a logger instance for these messages
 
-# Configure logger with line numbers and function names
+project_root_env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
+backend_env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
+logger_for_env_loading.info(f"Attempting to load .env from project root: {project_root_env_path}")
+if os.path.exists(project_root_env_path):
+    load_dotenv(dotenv_path=project_root_env_path, override=True)
+    logger_for_env_loading.info(f"Loaded .env from project root. OPENAI_API_KEY: {'SET' if os.getenv('OPENAI_API_KEY') else 'NOT SET'}")
+else:
+    logger_for_env_loading.warning(f"Project root .env file not found at: {project_root_env_path}")
+
+logger_for_env_loading.info(f"Attempting to load .env from backend directory: {backend_env_path}")
+if os.path.exists(backend_env_path):
+    load_dotenv(dotenv_path=backend_env_path, override=False) # Do not override if already set
+    logger_for_env_loading.info(f"Loaded .env from backend directory. OPENAI_API_KEY from env after backend .env: {'SET' if os.getenv('OPENAI_API_KEY') else 'NOT SET'}")
+else:
+    logger_for_env_loading.warning(f"Backend .env file not found at: {backend_env_path}")
+
+# CRITICAL DIAGNOSTIC LOGGING: Check environment variables immediately after dotenv loading
+openai_key_value = os.getenv('OPENAI_API_KEY')
+anthropic_key_value = os.getenv('ANTHROPIC_API_KEY')
+groq_key_value = os.getenv('GROQ_API_KEY')
+
+logger_for_env_loading.critical(f"DIAGNOSTIC - Post-dotenv OPENAI_API_KEY: {openai_key_value[:5] + '...' if openai_key_value else 'NOT SET'}")
+logger_for_env_loading.critical(f"DIAGNOSTIC - Post-dotenv ANTHROPIC_API_KEY: {anthropic_key_value[:5] + '...' if anthropic_key_value else 'NOT SET'}")
+logger_for_env_loading.critical(f"DIAGNOSTIC - Post-dotenv GROQ_API_KEY: {groq_key_value[:5] + '...' if groq_key_value else 'NOT SET'}")
+
+
+# This logger will inherit root configuration set by basicConfig
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Create console handler with formatting
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-
-# Create formatter with line numbers and function names
-formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-console_handler.setFormatter(formatter)
-
-# Add handler to logger if not already added
-if not logger.handlers:
-    logger.addHandler(console_handler)
-
-app = FastAPI(
-    title="Meeting Summarizer API",
-    description="API for processing and summarizing meeting transcripts",
-    version="1.0.0"
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],     # Allow all origins for testing
-    allow_credentials=True,
-    allow_methods=["*"],     # Allow all methods
-    allow_headers=["*"],     # Allow all headers
-    max_age=3600,            # Cache preflight requests for 1 hour
-)
 
 # Global database manager instance for meeting management endpoints
 db = DatabaseManager()
+logger.info(f"DatabaseManager initialized with db_path: {db.db_path}")
 
-# New Pydantic models for meeting management
-class Transcript(BaseModel):
-    id: str
-    text: str
-    timestamp: str
-
-class MeetingResponse(BaseModel):
-    id: str
-    title: str
-
-class MeetingDetailsResponse(BaseModel):
-    id: str
-    title: str
-    created_at: str
-    updated_at: str
-    transcripts: List[Transcript]
-
-class MeetingTitleUpdate(BaseModel):
-    meeting_id: str
-    title: str
-
-class DeleteMeetingRequest(BaseModel):
-    meeting_id: str
-
-class SaveTranscriptRequest(BaseModel):
-    meeting_title: str
-    transcripts: List[Transcript]
-
-class SaveModelConfigRequest(BaseModel):
-    provider: str
-    model: str
-    whisperModel: str
-    apiKey: Optional[str] = None
-
-class TranscriptRequest(BaseModel):
-    """Request model for transcript text, updated with meeting_id"""
-    text: str
-    model: str
-    model_name: str
-    meeting_id: str
-    chunk_size: Optional[int] = 5000
-    overlap: Optional[int] = 1000
-
+# SummaryProcessor class definition moved here
 class SummaryProcessor:
     """Handles the processing of summaries in a thread-safe way"""
-    def __init__(self):
+    def __init__(self, db_manager: DatabaseManager):
         try:
-            self.db = DatabaseManager()
-
+            self.db = db_manager # Use the passed-in db_manager
             logger.info("Initializing SummaryProcessor components")
-            self.transcript_processor = TranscriptProcessor()
+            self.transcript_processor = TranscriptProcessor(db_manager=self.db) # Pass db_manager
             logger.info("SummaryProcessor initialized successfully (core components)")
         except Exception as e:
             logger.error(f"Failed to initialize SummaryProcessor: {str(e)}", exc_info=True)
@@ -153,8 +115,67 @@ class SummaryProcessor:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
 
-# Initialize processor
-processor = SummaryProcessor()
+# Initialize SummaryProcessor with the db instance
+processor = SummaryProcessor(db_manager=db)
+logger.info("SummaryProcessor initialized with shared DatabaseManager.")
+
+app = FastAPI(
+    title="Meeting Summarizer API",
+    description="API for processing and summarizing meeting transcripts",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],     # Allow all origins for testing
+    allow_credentials=True,
+    allow_methods=["*"],     # Allow all methods
+    allow_headers=["*"],     # Allow all headers
+    max_age=3600,            # Cache preflight requests for 1 hour
+)
+
+# New Pydantic models for meeting management
+class Transcript(BaseModel):
+    id: str
+    text: str
+    timestamp: str
+
+class MeetingResponse(BaseModel):
+    id: str
+    title: str
+
+class MeetingDetailsResponse(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    transcripts: List[Transcript]
+
+class MeetingTitleUpdate(BaseModel):
+    meeting_id: str
+    title: str
+
+class DeleteMeetingRequest(BaseModel):
+    meeting_id: str
+
+class SaveTranscriptRequest(BaseModel):
+    meeting_title: str
+    transcripts: List[Transcript]
+
+class SaveModelConfigRequest(BaseModel):
+    provider: str
+    model: str
+    whisperModel: str
+    apiKey: Optional[str] = None
+
+class TranscriptRequest(BaseModel):
+    """Request model for transcript text, updated with meeting_id"""
+    text: str
+    model: str
+    model_name: str
+    meeting_id: str
+    chunk_size: Optional[int] = 5000
+    overlap: Optional[int] = 1000
 
 # New meeting management endpoints
 @app.get("/get-meetings", response_model=List[MeetingResponse])
@@ -207,12 +228,37 @@ async def delete_meeting(data: DeleteMeetingRequest):
 async def process_transcript_background(process_id: str, transcript: TranscriptRequest):
     """Background task to process transcript"""
     try:
-        logger.info(f"Starting background processing for process_id: {process_id}")
+        logger.info(f"BACKGROUND_TASK: Starting for process_id: {process_id}. Client requested model: {transcript.model}, name: {transcript.model_name}")
+
+        effective_model_provider = transcript.model
+        effective_model_name = transcript.model_name
+        
+        try:
+            current_db_config = await db.get_model_config()
+            logger.info(f"BACKGROUND_TASK: DB model config for {process_id}: {current_db_config}")
+
+            if transcript.model.lower() == "openai":
+                if current_db_config and current_db_config.get("provider", "").lower() == "openai" and current_db_config.get("model"):
+                    db_openai_model_name = current_db_config["model"]
+                    if db_openai_model_name != transcript.model_name:
+                        logger.warning(f"BACKGROUND_TASK: Client requested OpenAI model '{transcript.model_name}' for {process_id}, but DB config is '{db_openai_model_name}'. OVERRIDING to DB config.")
+                    else:
+                        logger.info(f"BACKGROUND_TASK: Client's OpenAI model '{transcript.model_name}' matches DB config for {process_id}.")
+                    effective_model_name = db_openai_model_name # Use DB model name for OpenAI
+                else:
+                    logger.error(f"BACKGROUND_TASK: Failed to get valid OpenAI model config from DB for {process_id}. DB responded with: {current_db_config}. Falling back to client's request: {transcript.model_name}")
+            else:
+                 logger.info(f"BACKGROUND_TASK: Provider is not OpenAI ({transcript.model}). Using client's model name: {transcript.model_name} for {process_id}.")
+
+        except Exception as e_db_config:
+            logger.error(f"BACKGROUND_TASK: EXCEPTION fetching DB model config for {process_id}: {e_db_config}. Falling back to client's request: {transcript.model_name}", exc_info=True)
+
+        logger.info(f"BACKGROUND_TASK: Effective model for {process_id}: Provider='{effective_model_provider}', Name='{effective_model_name}'")
 
         num_chunks, all_json_data = await processor.process_transcript(
             text=transcript.text,
-            model=transcript.model,
-            model_name=transcript.model_name,
+            model=effective_model_provider,
+            model_name=effective_model_name,
             chunk_size=transcript.chunk_size,
             overlap=transcript.overlap
         )
@@ -428,6 +474,9 @@ async def save_transcript(request: SaveTranscriptRequest):
 async def get_model_config():
     """Get the current model configuration"""
     model_config = await db.get_model_config()
+    if model_config is None:
+        raise HTTPException(status_code=404, detail="Model configuration not found.")
+
     api_key = await db.get_api_key(model_config["provider"])
     if api_key != None:
         model_config["apiKey"] = api_key
@@ -451,6 +500,16 @@ async def get_api_key(request: GetApiKeyRequest):
 
 
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Synchronize environment variables to DB on startup"""
+    logger.info("API starting up, attempting to synchronize environment variables to database.")
+    try:
+        await db.sync_env_vars_to_db()
+        logger.info("Successfully synchronized environment variables to database.")
+    except Exception as e:
+        logger.error(f"Error during startup synchronization of environment variables: {str(e)}", exc_info=True)
 
 @app.on_event("shutdown")
 async def shutdown_event():

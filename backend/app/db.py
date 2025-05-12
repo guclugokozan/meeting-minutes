@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional, Dict
 import logging
 from contextlib import asynccontextmanager
+import os # Added to access environment variables
 import sqlite3
 
 logger = logging.getLogger(__name__)
@@ -88,8 +89,63 @@ class DatabaseManager:
                 )
             """)
 
+            # Check if settings table is empty and insert default if so
+            cursor.execute("SELECT COUNT(*) FROM settings WHERE id = '1'")
+            # Use INSERT OR IGNORE to ensure the default settings row is created if it doesn't exist.
+            # This is more atomic and simpler than checking count first.
+            cursor.execute("""
+                INSERT OR IGNORE INTO settings (id, provider, model, whisperModel)
+                VALUES (?, ?, ?, ?)
+            """, ('1', 'openai', 'gpt-4o-mini', 'whisper-1')) # Default provider is openai, model is gpt-4o-mini
+            logger.info("Ensured default model configuration (using gpt-4o-mini for OpenAI) exists in settings table (used INSERT OR IGNORE).")
+            # API keys from environment variables will be synchronized by sync_env_vars_to_db()
+            # called during application startup in main.py.
             conn.commit()
 
+    async def sync_env_vars_to_db(self):
+        """Synchronize API keys from environment variables to the database."""
+        logger.info("Attempting to synchronize environment variables to database settings.")
+        made_changes = False
+        try:
+            async with self._get_connection() as conn:
+                # OpenAI
+                openai_key_env = os.getenv("OPENAI_API_KEY")
+                if openai_key_env:
+                    cursor = await conn.execute("UPDATE settings SET openaiApiKey = ? WHERE id = '1' AND (openaiApiKey IS NULL OR openaiApiKey != ?)", (openai_key_env, openai_key_env))
+                    if cursor.rowcount > 0:
+                        logger.info("Updated openaiApiKey in database from OPENAI_API_KEY environment variable via sync.")
+                        made_changes = True
+                else:
+                    logger.warning("OPENAI_API_KEY environment variable not found during sync. openaiApiKey in database not updated by sync.")
+
+                # Anthropic
+                anthropic_key_env = os.getenv("ANTHROPIC_API_KEY")
+                if anthropic_key_env:
+                    cursor = await conn.execute("UPDATE settings SET anthropicApiKey = ? WHERE id = '1' AND (anthropicApiKey IS NULL OR anthropicApiKey != ?)", (anthropic_key_env, anthropic_key_env))
+                    if cursor.rowcount > 0:
+                        logger.info("Updated anthropicApiKey in database from ANTHROPIC_API_KEY environment variable via sync.")
+                        made_changes = True
+                else:
+                    logger.warning("ANTHROPIC_API_KEY environment variable not found during sync. anthropicApiKey in database not updated by sync.")
+                
+                # Groq
+                groq_key_env = os.getenv("GROQ_API_KEY")
+                if groq_key_env:
+                    cursor = await conn.execute("UPDATE settings SET groqApiKey = ? WHERE id = '1' AND (groqApiKey IS NULL OR groqApiKey != ?)", (groq_key_env, groq_key_env))
+                    if cursor.rowcount > 0:
+                         logger.info("Updated groqApiKey in database from GROQ_API_KEY environment variable via sync.")
+                         made_changes = True
+                else:
+                    logger.warning("GROQ_API_KEY environment variable not found during sync. groqApiKey in database not updated by sync.")
+
+                if made_changes:
+                    await conn.commit()
+                    logger.info("Committed API key updates to database during sync.")
+                else:
+                    logger.info("No API key changes to commit during sync; values were already up-to-date or env vars not set.")
+        except Exception as e:
+            logger.error(f"Error during sync_env_vars_to_db: {e}", exc_info=True)
+            
     @asynccontextmanager
     async def _get_connection(self):
         """Get a new database connection"""
@@ -164,19 +220,32 @@ class DatabaseManager:
         """Save transcript data"""
         now = datetime.utcnow().isoformat()
         async with self._get_connection() as conn:
-            # First try to update existing transcript
-            await conn.execute("""
-                UPDATE transcript_chunks 
-                SET transcript_text = ?, model = ?, model_name = ?, chunk_size = ?, overlap = ?, created_at = ?
-                WHERE meeting_id = ?
-            """, (transcript_text, model, model_name, chunk_size, overlap, now, meeting_id))
+            # Attempt to fetch existing transcript text
+            cursor = await conn.execute("SELECT transcript_text FROM transcript_chunks WHERE meeting_id = ?", (meeting_id,))
+            row = await cursor.fetchone()
             
-            # If no rows were updated, insert a new one
-            if conn.total_changes == 0:
-                await conn.execute("""
-                    INSERT INTO transcript_chunks (meeting_id, transcript_text, model, model_name, chunk_size, overlap, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (meeting_id, transcript_text, model, model_name, chunk_size, overlap, now))
+            existing_text = ""
+            if row and row[0]:
+                existing_text = row[0]
+            
+            # Append new transcript text to existing, ensuring a space or newline if existing_text is not empty
+            # and new text doesn't naturally start with a space (common in HTML div structures)
+            if existing_text and transcript_text:
+                # A simple space might be enough, or consider if specific formatting like newline is better
+                # For HTML content, just concatenating might be fine if each chunk is a self-contained div
+                accumulated_transcript_text = existing_text + transcript_text
+            else:
+                accumulated_transcript_text = transcript_text or existing_text # Handles cases where one is empty
+
+            # Use INSERT OR REPLACE to handle both new and existing meeting_ids
+            # This simplifies logic compared to UPDATE then INSERT.
+            # Note: If other fields should not be overwritten on replace, this strategy needs adjustment.
+            # For transcript_chunks, overwriting model, model_name, chunk_size, overlap with latest values seems acceptable.
+            await conn.execute("""
+                INSERT OR REPLACE INTO transcript_chunks
+                (meeting_id, transcript_text, model, model_name, chunk_size, overlap, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (meeting_id, accumulated_transcript_text, model, model_name, chunk_size, overlap, now))
             
             await conn.commit()
 
@@ -347,7 +416,7 @@ class DatabaseManager:
     async def get_model_config(self):
         """Get the current model configuration"""
         async with self._get_connection() as conn:
-            cursor = await conn.execute("SELECT provider, model, whisperModel FROM settings")
+            cursor = await conn.execute("SELECT provider, model, whisperModel FROM settings WHERE id = '1'")
             row = await cursor.fetchone()
             return dict(zip([col[0] for col in cursor.description], row)) if row else None
 
@@ -406,7 +475,12 @@ class DatabaseManager:
         async with self._get_connection() as conn:
             cursor = await conn.execute(f"SELECT {api_key_name} FROM settings WHERE id = '1'")
             row = await cursor.fetchone()
-            return row[0] if row else None
+            # API keys should now be populated in the DB by _init_db() from environment variables.
+            # So, we just return what's in the DB.
+            api_key_value = row[0] if row and row[0] else None
+            if not api_key_value:
+                logger.warning(f"API key for provider '{provider}' not found in database for settings id '1'.")
+            return api_key_value
         
     async def delete_api_key(self, provider: str):
         """Delete the API key"""

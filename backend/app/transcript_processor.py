@@ -21,10 +21,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()  # Load environment variables from .env file
-
-db = DatabaseManager()
-
 class Block(BaseModel):
     """Represents a block of content in a section"""
     id: str
@@ -52,10 +48,10 @@ class SummaryResponse(BaseModel):
 
 class TranscriptProcessor:
     """Handles the processing of meeting transcripts using AI models."""
-    def __init__(self):
+    def __init__(self, db_manager: DatabaseManager):
         """Initialize the transcript processor."""
         logger.info("TranscriptProcessor initialized.")
-        self.db = DatabaseManager()
+        self.db = db_manager
     async def process_transcript(self, text: str, model: str, model_name: str, chunk_size: int = 5000, overlap: int = 1000) -> Tuple[int, List[str]]:
         """
         Process transcript text into chunks and generate structured summaries for each chunk using an AI model.
@@ -82,7 +78,7 @@ class TranscriptProcessor:
         try:
             # Select and initialize the AI model and agent
             if model == "claude":
-                api_key = await db.get_api_key("claude")
+                api_key = await self.db.get_api_key("claude")
                 if not api_key: raise ValueError("ANTHROPIC_API_KEY environment variable not set")
                 llm = AnthropicModel(model_name, api_key=api_key)
                 logger.info(f"Using Claude model: {model_name}")
@@ -92,13 +88,13 @@ class TranscriptProcessor:
                 llm = OllamaModel(model_name)
                 logger.info(f"Using Ollama model: {model_name}")
             elif model == "groq":
-                api_key = await db.get_api_key("groq")
+                api_key = await self.db.get_api_key("groq")
                 if not api_key: raise ValueError("GROQ_API_KEY environment variable not set")
                 llm = GroqModel(model_name, api_key=api_key)
                 logger.info(f"Using Groq model: {model_name}")
             # --- ADD OPENAI SUPPORT HERE ---
             elif model == "openai":
-                api_key = await db.get_api_key("openai")
+                api_key = await self.db.get_api_key("openai")
                 if not api_key: raise ValueError("OPENAI_API_KEY environment variable not set")
                 llm = OpenAIModel(model_name, api_key=api_key)
                 logger.info(f"Using OpenAI model: {model_name}")
