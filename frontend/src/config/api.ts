@@ -1,7 +1,7 @@
-// TODO: Replace with your deployed backend API URL
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'YOUR_DEPLOYED_BACKEND_API_URL_HERE';
+// Use the ngrok URL for the backend API during development/testing
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'https://8e00-136-24-118-41.ngrok-free.app';
 
-// TODO: Replace with your deployed Ollama API URL if you are self-hosting Ollama for production,
+// Keep Ollama local for now, unless it's also tunneled or deployed publicly.
 // or consider using a cloud-based model provider for deployed environments.
 const OLLAMA_API_BASE_URL = process.env.NEXT_PUBLIC_OLLAMA_API_BASE_URL || 'http://localhost:11434';
 
