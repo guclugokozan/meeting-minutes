@@ -1,10 +1,8 @@
 'use client';
 
-import { invoke } from '@tauri-apps/api/core';
-import { appDataDir } from '@tauri-apps/api/path';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { Play, Pause, Square, Mic } from 'lucide-react';
-import { ProcessRequest, SummaryResponse } from '@/types/summary';
+import { SummaryResponse } from '@/types/summary';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -22,7 +20,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   onTranscriptReceived,
 }) => {
   const [showPlayback, setShowPlayback] = useState(false);
-  const [recordingPath, setRecordingPath] = useState<string | null>(null);
+  const [recordingPath, setRecordingPath] = useState<string | null>(null); // Will store Blob URL
   const [transcript, setTranscript] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
@@ -30,7 +28,11 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const [stopCountdown, setStopCountdown] = useState(5);
   const countdownInterval = useRef<NodeJS.Timeout | null>(null);
   const stopTimeoutRef = useRef<{ stop: () => void } | null>(null);
-  const MIN_RECORDING_DURATION = 2000; // 2 seconds minimum recording time
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+
 
   const currentTime = 0;
   const duration = 0;
@@ -43,85 +45,122 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  useEffect(() => {
-    const checkTauri = async () => {
-      try {
-        const result = await invoke('is_recording');
-        console.log('Tauri is initialized and ready, is_recording result:', result);
-      } catch (error) {
-        console.error('Tauri initialization error:', error);
-        alert('Failed to initialize recording. Please check the console for details.');
-      }
-    };
-    checkTauri();
-  }, []);
+  // Tauri-specific useEffect removed.
 
   const handleStartRecording = useCallback(async () => {
-    if (isStarting) return;
-    console.log('Starting recording...');
+    if (isStarting || isRecording) return;
+    console.log('Starting recording (Web API)...');
     setIsStarting(true);
     setShowPlayback(false);
-    setTranscript(''); // Clear any previous transcript
-    
+    setTranscript('');
+    audioChunksRef.current = []; // Clear previous chunks
+
     try {
-      await invoke('start_recording');
-      console.log('Recording started successfully');
-      setIsProcessing(false);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      mediaRecorderRef.current = new MediaRecorder(stream);
+
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        console.log('MediaRecorder stopped.');
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        setRecordingPath(audioUrl);
+        // setShowPlayback(true); // You might want to enable playback UI here
+
+        // TODO: Send audioBlob to backend for transcription
+        // For now, we'll just log it and call onRecordingStop
+        console.log('Recorded audio Blob:', audioBlob);
+        console.log('Blob URL:', audioUrl);
+        
+        // Simulate processing for now
+        setIsProcessing(true);
+        // Replace with actual API call to backend
+        // const formData = new FormData();
+        // formData.append('audio_file', audioBlob, 'recording.webm');
+        // try {
+        //   const response = await fetch('/api/transcribe', { // Replace with your actual API endpoint
+        //     method: 'POST',
+        //     body: formData,
+        //   });
+        //   if (!response.ok) throw new Error('Transcription failed');
+        //   const summary: SummaryResponse = await response.json();
+        //   onTranscriptReceived(summary);
+        // } catch (transcriptionError) {
+        //   console.error('Transcription error:', transcriptionError);
+        //   alert('Failed to get transcript. Please check console.');
+        // } finally {
+        //   setIsProcessing(false);
+        // }
+        
+        // For now, just stop processing and call onRecordingStop
+        setTimeout(() => { // Simulate delay
+            setIsProcessing(false);
+            onRecordingStop();
+        }, 1000);
+
+
+        // Clean up the stream
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
+      };
+
+      mediaRecorderRef.current.start();
+      console.log('MediaRecorder started successfully.');
+      setIsProcessing(false); // No initial processing for start
       onRecordingStart();
     } catch (error) {
-      console.error('Failed to start recording:', error);
-      alert('Failed to start recording. Please check the console for details.');
+      console.error('Failed to start recording (Web API):', error);
+      alert('Failed to start recording. Please ensure microphone access is granted and check the console for details.');
+      // Clean up the stream if it was partially started
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
     } finally {
       setIsStarting(false);
     }
-  }, [onRecordingStart, isStarting]);
+  }, [onRecordingStart, onTranscriptReceived, isRecording, isStarting]);
 
   const stopRecordingAction = useCallback(async () => {
-    console.log('Executing stop recording...');
-    try {
-      setIsProcessing(true);
-      const dataDir = await appDataDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const savePath = `${dataDir}/recording-${timestamp}.wav`;
-      
-      console.log('Saving recording to:', savePath);
-      const result = await invoke('stop_recording', { 
-        args: {
-          save_path: savePath
-        }
-      });
-      
-      setRecordingPath(savePath);
-      // setShowPlayback(true);
-      setIsProcessing(false);
+    console.log('Executing stop recording (Web API)...');
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop(); // This will trigger the onstop event
+    } else {
+      console.warn('MediaRecorder not recording or not initialized.');
+      // If not recording, ensure UI reflects this
       onRecordingStop();
-    } catch (error) {
-      console.error('Failed to stop recording:', error);
-      if (error instanceof Error) {
-        console.error('Error details:', {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        });
-        if (error.message.includes('No recording in progress')) {
-          return;
-        }
-      } else if (typeof error === 'string' && error.includes('No recording in progress')) {
-        return;
-      } else if (error && typeof error === 'object' && 'toString' in error) {
-        if (error.toString().includes('No recording in progress')) {
-          return;
-        }
-      }
-      setIsProcessing(false);
-      onRecordingStop();
-    } finally {
-      setIsStopping(false);
     }
+    // setIsProcessing(true) is handled in onstop or if needed here
+    // onRecordingStop() is called in onstop or if stop is called when not recording
+    setIsStopping(false); // Reset stopping flag
   }, [onRecordingStop]);
+  
+  // useEffect for cleanup
+  useEffect(() => {
+    return () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (countdownInterval.current) {
+        clearInterval(countdownInterval.current);
+      }
+    };
+  }, []);
+
 
   const handleStopRecording = useCallback(async () => {
-    if (!isRecording || isStarting || isStopping) return;
+    if (!isRecording || isStarting || isStopping ) return;
     
     console.log('Starting stop countdown...');
     setIsStopping(true);
