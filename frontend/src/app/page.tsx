@@ -15,6 +15,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useNavigation } from '@/hooks/useNavigation';
 import { useRouter } from 'next/navigation';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
+import { getApiUrl, getOllamaApiUrl, OLLAMA_TAGS_ENDPOINT, SAVE_TRANSCRIPT_ENDPOINT, PROCESS_TRANSCRIPT_ENDPOINT, GET_SUMMARY_ENDPOINT } from '@/config/api';
 
 interface TranscriptUpdate {
   text: string;
@@ -212,7 +213,7 @@ export default function Home() {
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await fetch('http://localhost:11434/api/tags', {
+        const response = await fetch(getOllamaApiUrl(OLLAMA_TAGS_ENDPOINT), {
           method: 'GET',
           headers: {
             'Content-Type': 'application/json',
@@ -362,7 +363,7 @@ export default function Home() {
       // Save to SQLite
       if (isCallApi) {
         console.log('Saving transcript to database...', transcripts);
-        const response = await fetch('http://localhost:5167/save-transcript', {
+        const response = await fetch(getApiUrl(SAVE_TRANSCRIPT_ENDPOINT), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -438,7 +439,7 @@ export default function Home() {
       
       // Process transcript and get process_id
       console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
+      const response = await fetch(getApiUrl(PROCESS_TRANSCRIPT_ENDPOINT), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -465,7 +466,7 @@ export default function Home() {
       // Poll for summary status
       const pollInterval = setInterval(async () => {
         try {
-          const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
+          const statusResponse = await fetch(getApiUrl(`${GET_SUMMARY_ENDPOINT}/${process_id}`));
           
           if (!statusResponse.ok) {
             const errorData = await statusResponse.json();
